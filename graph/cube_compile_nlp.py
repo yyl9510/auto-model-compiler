@@ -1,4 +1,5 @@
 # pip install sentencepiece transformers fuzzywuzzy concurrent-log-handler psutilfrom multiprocessing.managers import ListProxy
+# pip install transformers timeout-decorator
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -93,20 +94,22 @@ def print_memory_usage(logger, prefix : str = ""):
     import subprocess
     process = psutil.Process()
     mem_info = process.memory_info()
-    logger.info("When " + prefix + f": Current memory usage: {mem_info.rss / (1024 ** 3):.2f} GB")
+    logger.debug("When " + prefix + f": Current memory usage: {mem_info.rss / (1024 ** 3):.2f} GB")
     try:
         smi_output = subprocess.check_output(
             ['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,nounits,noheader'],
             encoding='utf-8'
         )
         memory_info = smi_output.strip().split('\n')
+        gpu_mem_tuple = []
         for idx, mem in enumerate(memory_info):
             used, total = mem.split(', ')
-            logger.info(f"GPU {idx}: used {used}MiB / total {total}MiB")
+            gpu_mem_tuple.append((idx, int(used) / 1024, int(total) / 1024))
+        logger.debug(f"GPU memory usage (index, used-GB, total-GB): {gpu_mem_tuple}")
     except subprocess.CalledProcessError as e:
-        logger.info("Can't execute nvidia-smi command:", e.output)
+        logger.error("Can't execute nvidia-smi command:", e.output)
     except FileNotFoundError:
-        logger.info("nvidia-smi command not found , make sure nvidia driver has been install successfully.")
+        logger.error("nvidia-smi command not found , make sure nvidia driver has been install successfully.")
 
 def concrete_trace_wrap(model, dummy_input):
     if torch.cuda.is_available():
@@ -144,7 +147,6 @@ def cube_compile_check(model_name: str):
         logger.debug(f"dummy_input: {dummy_input}")
 
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
-        logger.warning(f"is model_name a encoder_decoder model: {config.is_encoder_decoder}")
         logger.info(f"{model_name} config loaded")
 
         model = load_model_with_timeout(config, trust_remote_code=True)
@@ -221,17 +223,13 @@ if __name__ == "__main__":
         os.makedirs(nlp_dir)
 
     tried_models = set()
-    if os.path.exists(os.path.join(nlp_dir, "tried")):
-        with open(os.path.join(nlp_dir, "tried"), 'r') as file:
+    if os.path.exists(os.path.join(nlp_dir, "cube_compile_2_tried.log")):
+        with open(os.path.join(nlp_dir, "cube_compile_2_tried.log"), 'r') as file:
             names = [line.strip() for line in file]
             tried_models = set(names)
     model_name_set = all_model - tried_models
     print(f"# already_tried: {len(tried_models)}")
     print(f"# need_to_try: {len(model_name_set)}")
-
-    mem_info = psutil.virtual_memory()
-    total_memory = mem_info.total
-    print(f"Total memory: {total_memory / (1024 ** 3):.2f} GB")
 
     model_numbers = 0
     for model_name in model_name_set:
