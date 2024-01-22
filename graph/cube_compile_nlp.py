@@ -11,7 +11,6 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer
 from cube.graph.parser.converter import to_fx_graph
 
 import psutil
-from concurrent_log_handler import ConcurrentRotatingFileHandler 
 import logging
 import time
 import timeout_decorator
@@ -22,7 +21,6 @@ import examples.mlp.policy.gallery as gallery
 from functools import partial
 import inspect
 
-
 text: str = "Huggingface is a really excellent project!"
 cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
 
@@ -31,22 +29,53 @@ current_folder = os.path.dirname(current_file_path)
 model_name_set_path = os.path.join(current_folder, "huggingface_model_names/nlp_test")
 nlp_dir = os.path.join(current_folder, "nlp")
 
-def setup_logger(log_file, level):
+def setup_logger(log_file, level = logging.INFO, need_timestamp = True):
     # different process has different logger, with timestamp
     logger = logging.getLogger(log_file)
     logger.setLevel(level)
     # logger will only init once for one log_file
-    if not logger.handlers: 
-        handler = ConcurrentRotatingFileHandler(log_file, "a", 1024*1024, 8)
-        formatter = logging.Formatter('%(asctime)s [PID %(process)d][%(levelname)s]: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')  
-        handler.setFormatter(formatter)
+    if not logger.handlers:
+        handler = logging.FileHandler(log_file, "a")
+        if need_timestamp:
+            formatter = logging.Formatter('%(asctime)s [PID %(process)d][%(levelname)s]: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+            handler.setFormatter(formatter)
         logger.addHandler(handler)
     return logger
 
-logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_info.log'), logging.INFO)
-error_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_error.log'), logging.WARNING)
+def logger_redirect(logger1, to_logger_file, prefix = '', need_timestamp=True) -> logging.FileHandler:
+    import logging
+    result_handler = logging.FileHandler(to_logger_file, 'a')
+    if need_timestamp:
+        formatter = logging.Formatter(f'%(asctime)s [PID %(process)d][%(levelname)s]: {prefix} %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    else:
+        formatter = logging.Formatter(f'{prefix} %(message)s')
+    result_handler.setFormatter(formatter)
+    logger1.addHandler(result_handler)
+    return result_handler
 
-torch.set_printoptions(edgeitems=2)
+logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_1_info.log'), logging.INFO)
+error_out_cube_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_8_error_out_cube.log'), logging.WARNING)
+error_in_cube_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_9_error_in_cube.log'), logging.WARNING)
+
+logger_redirect(error_in_cube_logger, os.path.join(nlp_dir, f'cube_compile_1_info.log'), "", False)
+logger_redirect(error_out_cube_logger, os.path.join(nlp_dir, f'cube_compile_1_info.log'), "", False)
+
+tried_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_2_tried.log'), logging.INFO, False)
+loaded_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_3_loaded.log'), logging.INFO, False)
+traced_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_4_traced.log'), logging.INFO, False)
+trace_aligned_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_5_trace_aligned.log'), logging.INFO, False)
+compiled_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_6_compiled.log'), logging.INFO, False)
+aligned_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_7_compile_aligned.log'), logging.INFO, False)
+
+logger_redirect(tried_logger, os.path.join(nlp_dir, f'cube_compile_1_info.log'), prefix="model tried: ")
+logger_redirect(loaded_logger, os.path.join(nlp_dir, f'cube_compile_1_info.log'), prefix="model loaded: ")
+logger_redirect(traced_logger, os.path.join(nlp_dir, f'cube_compile_1_info.log'), prefix="model traced: ")
+logger_redirect(trace_aligned_logger, os.path.join(nlp_dir, f'cube_compile_1_info.log'), prefix="model trace aligned: ")
+logger_redirect(compiled_logger, os.path.join(nlp_dir, f'cube_compile_1_info.log'), prefix="model compiled: ")
+logger_redirect(aligned_logger, os.path.join(nlp_dir, f'cube_compile_1_info.log'), prefix="model aligned: ")
+
+
+torch.set_printoptions(edgeitems = 2)
 cube.init()
 
 # get policy
@@ -77,7 +106,6 @@ def print_memory_usage(logger, prefix : str = ""):
     except FileNotFoundError:
         logger.info("nvidia-smi command not found , make sure nvidia driver has been install successfully.")
 
-
 def concrete_trace_wrap(model, dummy_input):
     if torch.cuda.is_available():
         try:
@@ -102,7 +130,7 @@ def check_align(before_trace, after_trace):
 def cube_compile_check(model_name: str):
     try:
         start_time = time.time()
-        logger.info(f"start trying model: {model_name}")
+        tried_logger.info(f"{model_name}")
   
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
         logger.info(f"{model_name} Tokenizer loaded")
@@ -114,10 +142,11 @@ def cube_compile_check(model_name: str):
         logger.debug(f"dummy_input: {dummy_input}")
 
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
+        logger.warning(f"is model_name a encoder_decoder model: {config.is_encoder_decoder}")
         logger.info(f"{model_name} config loaded")
 
         model = load_model_with_timeout(config, trust_remote_code=True)
-        logger.info(f"{model_name} model loaded")
+        loaded_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
         logger.debug(f"{model_name} has parameter: {sum(p.numel() for p in model.parameters())}")
         print_memory_usage(logger, f"after load model {model_name}")
 
@@ -126,16 +155,15 @@ def cube_compile_check(model_name: str):
         logger.debug(f"original logit: {before_trace['last_hidden_state'][:2]}")
 
         traced_gm = concrete_trace_wrap(model, dummy_input)
-        logger.info(f"{model_name} model traced")
+        traced_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
         traced_gm.eval()
         after_trace = traced_gm(**dummy_input)
         logger.debug(f"traced logit: {after_trace['last_hidden_state'][:2]}")
 
         if check_align(before_trace, after_trace):
-            logger.info(f"aligned before and after trace: {model_name}, {config.architectures}")
+            trace_aligned_logger.info(f"{model_name}, {config.architectures}")
         else:
-            logger.error(f"not aligned before and after trace: {model_name}, {config.architectures}")
-            error_logger.error(f"not aligned before and after trace: {model_name}, {config.architectures}")
+            error_in_cube_logger.error(f"{model_name} not aligned before and after trace\n before trace: {before_trace}\n after trace: {after_trace}\n")
 
         # cube compile model
         model = load_model_with_timeout(config, trust_remote_code=True)
@@ -157,31 +185,30 @@ def cube_compile_check(model_name: str):
             return logit
 
         smodel = cube.utils.load_model()
+        compiled_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
         smodel.eval()
         compiled_logit = train_iter(smodel, dataloader)
         logger.debug(f"compiled logit: {compiled_logit['last_hidden_state'][:2]}")
 
         if check_align(before_trace, compiled_logit):
-            logger.info(f"aligned before trace and after compile: {model_name}, {config.architectures}")
+            aligned_logger.info(f"aligned before trace and after compile: {model_name}, {config.architectures}")
         else:
-            logger.error(f"not aligned before trace and after compile: {model_name}, {config.architectures}")
-            error_logger.error(f"not aligned before trace and after compile: {model_name}, {config.architectures}")
+            error_in_cube_logger.error(f"{model_name} not aligned before trace and after compile\n before trace: {before_trace}\n after trace: {compiled_logit}\n")
 
     except (Exception, TimeoutError) as e:
         logger.error(f"fail when trying model: {model_name}", exc_info=False)
-        error_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
         error_message = traceback.format_exc()
-
-        error_logger.error(f"{model_name} failed")
-        if 'config' in locals() and config:
-            error_logger.error(f"Architectures: {config.architectures}")
-        error_logger.error(error_message)
+        if 'MagicCube' in error_message:
+            error_in_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
+            error_in_cube_logger.error(error_message)
+        else:
+            error_out_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
+            error_out_cube_logger.error(error_message)
     finally:
         end_time = time.time()
         logger.info(f"Finish trying model: {model_name}, time: {end_time - start_time:.2f} s")
 
 if __name__ == "__main__":
-
     with open(model_name_set_path, 'r') as f:
         all_model = eval(f.read())
     print(f"# model: {len(all_model)}")
