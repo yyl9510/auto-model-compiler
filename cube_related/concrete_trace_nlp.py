@@ -23,6 +23,13 @@ import timeout_decorator
 text: str = "Huggingface is a really excellent project!"
 cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
 
+current_file_path = os.path.abspath(__file__)
+current_folder = os.path.dirname(current_file_path)
+model_name_list_path = os.path.join(current_folder, "models/Natural Language Processing")
+log_dir = os.path.join(current_folder, "logs")
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
 torch.set_printoptions(edgeitems=2)
 
 @timeout_decorator.timeout(120, timeout_exception=TimeoutError)
@@ -108,24 +115,24 @@ def get_process_num(process_num_list: ListProxy):
             return i
     raise RuntimeError(f"No available process number, current {process_num_list}")
 
-def trace_worker(model_name: str, nlp_dir: str, process_num_list: ListProxy, model_name_list: ListProxy):
-    p = multiprocessing.Process(target=trace_single_model, args=(model_name, nlp_dir, process_num_list, model_name_list))   # , daemon=True
+def trace_worker(model_name: str, log_dir: str, process_num_list: ListProxy, model_name_list: ListProxy):
+    p = multiprocessing.Process(target=trace_single_model, args=(model_name, log_dir, process_num_list, model_name_list))   # , daemon=True
     p.start()
     p.join()
 
 
-def trace_single_model(model_name: str, nlp_dir: str, process_num_list: ListProxy, model_name_list: ListProxy):
+def trace_single_model(model_name: str, log_dir: str, process_num_list: ListProxy, model_name_list: ListProxy):
     try:
         process_num = get_process_num(process_num_list)
-        logger = setup_logger(os.path.join(nlp_dir, f'all4debug_{process_num}.log'), logging.INFO)
+        logger = setup_logger(os.path.join(log_dir, f'all4debug_{process_num}.log'), logging.INFO)
 
         model_loaded = False
         success_traced = False
-        logger_tried = setup_logger2(os.path.join(nlp_dir, 'tried'), logging.INFO)
-        logger_loaded = setup_logger2(os.path.join(nlp_dir, 'model_loaded'), logging.INFO)
-        logger_traced = setup_logger2(os.path.join(nlp_dir, 'success_traced'), logging.INFO)
-        logger_failed = setup_logger2(os.path.join(nlp_dir, 'model_failed'), logging.INFO)
-        logger_errors = setup_logger2(os.path.join(nlp_dir, 'errors'), logging.INFO)
+        logger_tried = setup_logger2(os.path.join(log_dir, 'tried'), logging.INFO)
+        logger_loaded = setup_logger2(os.path.join(log_dir, 'model_loaded'), logging.INFO)
+        logger_traced = setup_logger2(os.path.join(log_dir, 'success_traced'), logging.INFO)
+        logger_failed = setup_logger2(os.path.join(log_dir, 'model_failed'), logging.INFO)
+        logger_errors = setup_logger2(os.path.join(log_dir, 'errors'), logging.INFO)
 
         start_time = time.time()
         logger.info(f"start trying model: {model_name}")
@@ -185,25 +192,21 @@ def trace_single_model(model_name: str, nlp_dir: str, process_num_list: ListProx
 
 
 if __name__ == "__main__":
-    current_file_path = os.path.abspath(__file__)
-    current_folder = os.path.dirname(current_file_path)
-    model_name_set_path = os.path.join(current_folder, "huggingface_model_names/model_name_set_nlp")
-    with open(model_name_set_path, 'r') as f:
-        all_model = eval(f.read())
-    print(f"# model: {len(all_model)}")
+    model_names = []
+    with open(model_name_list_path, 'r') as f:
+        for line in f:
+            model_name = line.strip()
+            if model_name and model_name not in model_names:
+                model_names.append(model_name)
+    print(f"# model_name_list: {len(model_names)}")
 
-    nlp_dir = os.path.join(current_folder, "nlp")
-    if not os.path.exists(nlp_dir):
-        os.makedirs(nlp_dir)
-
-    tried_models = set()
-    if os.path.exists(os.path.join(nlp_dir, "tried")):
-        with open(os.path.join(nlp_dir, "tried"), 'r') as file:
-            names = [line.strip() for line in file]
-            tried_models = set(names)
-    model_name_set = all_model - tried_models
+    tried_models = []
+    if os.path.exists(os.path.join(log_dir, "tried")):
+        with open(os.path.join(log_dir, "tried"), 'r') as file:
+            tried_models = [line.strip() for line in file]
+    model_name_list = [model for model in model_names if model not in tried_models]
     print(f"# already_tried: {len(tried_models)}")
-    print(f"# need_to_try: {len(model_name_set)}")
+    print(f"# need_to_try: {len(model_name_list)}")
 
     mem_info = psutil.virtual_memory()
     total_memory = mem_info.total
@@ -211,10 +214,9 @@ if __name__ == "__main__":
 
     process_num = multiprocessing.cpu_count() - 20
     with multiprocessing.Manager() as manager:
-        model_name_list = manager.list(model_name_set)
-        
+        model_name_list1 = manager.list(model_name_list)
         process_num_list = manager.list([0] * process_num)
-        arguments = [(model_name, nlp_dir, process_num_list, model_name_list) for model_name in model_name_set]
+        arguments = [(model_name, log_dir, process_num_list, model_name_list1) for model_name in model_name_list1]
         with ThreadPool(processes = process_num) as pool:
             pool.starmap(trace_worker, arguments)
 

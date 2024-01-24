@@ -27,8 +27,10 @@ cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
 
 current_file_path = os.path.abspath(__file__)
 current_folder = os.path.dirname(current_file_path)
-model_name_set_path = os.path.join(current_folder, "huggingface_model_names/nlp_test")
-nlp_dir = os.path.join(current_folder, "nlp")
+model_name_list_path = os.path.join(current_folder, "models/Natural Language Processing")
+log_dir = os.path.join(current_folder, "logs")
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
 
 def setup_logger(log_file, level = logging.INFO, need_timestamp = True):
     # different process has different logger, with timestamp
@@ -55,37 +57,37 @@ def logger_redirect(logger1, to_logger_file, prefix = '', need_timestamp=True) -
     return result_handler
 
 loglevel = logging.INFO
-info_path = os.path.join(nlp_dir, f'cube_compile_1_info.log')
-logger = setup_logger(os.path.join(nlp_dir, info_path), loglevel)
+info_path = os.path.join(log_dir, f'cube_compile_1_info.log')
+logger = setup_logger(os.path.join(log_dir, info_path), loglevel)
 
-tried_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_2_tried.log'), loglevel, False)
-loaded_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_3_loaded.log'), loglevel, False)
-traced_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_4_traced.log'), loglevel, False)
-trace_aligned_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_5_trace_aligned.log'), loglevel, False)
-compiled_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_6_compiled.log'), loglevel, False)
-aligned_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_7_compile_aligned.log'), loglevel, False)
+tried_logger = setup_logger(os.path.join(log_dir, f'cube_compile_2_tried.log'), loglevel, False)
+loaded_logger = setup_logger(os.path.join(log_dir, f'cube_compile_3_loaded.log'), loglevel, False)
+traced_logger = setup_logger(os.path.join(log_dir, f'cube_compile_4_traced.log'), loglevel, False)
+trace_aligned_logger = setup_logger(os.path.join(log_dir, f'cube_compile_5_trace_aligned.log'), loglevel, False)
+compiled_logger = setup_logger(os.path.join(log_dir, f'cube_compile_6_compiled.log'), loglevel, False)
+aligned_logger = setup_logger(os.path.join(log_dir, f'cube_compile_7_compile_aligned.log'), loglevel, False)
 
-logger_redirect(tried_logger, os.path.join(nlp_dir, info_path), prefix="model tried: ")
-logger_redirect(loaded_logger, os.path.join(nlp_dir, info_path), prefix="model loaded: ")
-logger_redirect(traced_logger, os.path.join(nlp_dir, info_path), prefix="model traced: ")
-logger_redirect(trace_aligned_logger, os.path.join(nlp_dir, info_path), prefix="model trace aligned: ")
-logger_redirect(compiled_logger, os.path.join(nlp_dir, info_path), prefix="model compiled: ")
-logger_redirect(aligned_logger, os.path.join(nlp_dir, info_path), prefix="model aligned: ")
+logger_redirect(tried_logger, os.path.join(log_dir, info_path), prefix="model tried: ")
+logger_redirect(loaded_logger, os.path.join(log_dir, info_path), prefix="model loaded: ")
+logger_redirect(traced_logger, os.path.join(log_dir, info_path), prefix="model traced: ")
+logger_redirect(trace_aligned_logger, os.path.join(log_dir, info_path), prefix="model trace aligned: ")
+logger_redirect(compiled_logger, os.path.join(log_dir, info_path), prefix="model compiled: ")
+logger_redirect(aligned_logger, os.path.join(log_dir, info_path), prefix="model aligned: ")
 
-error_out_cube_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_8_error_out_cube.log'), loglevel)
-error_in_cube_logger = setup_logger(os.path.join(nlp_dir, f'cube_compile_9_error_in_cube.log'), loglevel)
+error_out_cube_logger = setup_logger(os.path.join(log_dir, f'cube_compile_8_error_out_cube.log'), loglevel)
+error_in_cube_logger = setup_logger(os.path.join(log_dir, f'cube_compile_9_error_in_cube.log'), loglevel)
 
-logger_redirect(error_in_cube_logger, os.path.join(nlp_dir, info_path), "", False)
-logger_redirect(error_out_cube_logger, os.path.join(nlp_dir, info_path), "", False)
+logger_redirect(error_in_cube_logger, os.path.join(log_dir, info_path), "", False)
+logger_redirect(error_out_cube_logger, os.path.join(log_dir, info_path), "", False)
 
 torch.set_printoptions(edgeitems = 2)
-cube.init()
 
+cube.init()
 # get policy
 policy = get_policy([gallery], "PASMegatronTP")
 policy = partial(policy, nmicros=64//64, tp_size=2)
 
-@timeout_decorator.timeout(120, timeout_exception=TimeoutError)
+# @timeout_decorator.timeout(120, timeout_exception=TimeoutError)
 def load_model_with_timeout(config, trust_remote_code):
     torch.manual_seed(0)
     return AutoModel.from_config(config, trust_remote_code=trust_remote_code)
@@ -115,7 +117,7 @@ def concrete_trace_wrap(model, dummy_input):
     if torch.cuda.is_available():
         try:
             traced_gm = to_fx_graph(model, dummy_input)
-            
+
         except:
             raise Exception("Failed to trace with gpu")
         print("Successfully traced with gpu")
@@ -126,11 +128,17 @@ def concrete_trace_wrap(model, dummy_input):
 def check_align(before_trace, after_trace):
     for key in after_trace.keys():
         if isinstance(after_trace[key], torch.Tensor):
-            if not torch.allclose(before_trace[key].to(torch.cuda.current_device()) ,
+            if not torch.allclose(before_trace[key].to(torch.cuda.current_device()),
                                   after_trace[key].to(torch.cuda.current_device()), 
-                                  rtol=1e-04, atol=1e-05):
+                                  rtol=1e-04, atol=1e-04):
                 return False
     return True
+
+# def trace_worker(model_name: str):
+#     import multiprocessing
+#     p = multiprocessing.Process(target=cube_compile_check, args=(model_name, ))   # , daemon=True
+#     p.start()
+#     p.join()
 
 def cube_compile_check(model_name: str):
     try:
@@ -214,25 +222,26 @@ def cube_compile_check(model_name: str):
         end_time = time.time()
         logger.info(f"Finish trying model: {model_name}, time: {end_time - start_time:.2f} s")
 
+
 if __name__ == "__main__":
-    with open(model_name_set_path, 'r') as f:
-        all_model = eval(f.read())
-    print(f"# model: {len(all_model)}")
+    model_names = []
+    with open(model_name_list_path, 'r') as f:
+        for line in f:
+            model_name = line.strip()
+            if model_name and model_name not in model_names:
+                model_names.append(model_name)
+    print(f"# model_name_list: {len(model_names)}")
 
-    if not os.path.exists(nlp_dir):
-        os.makedirs(nlp_dir)
-
-    tried_models = set()
-    if os.path.exists(os.path.join(nlp_dir, "cube_compile_2_tried.log")):
-        with open(os.path.join(nlp_dir, "cube_compile_2_tried.log"), 'r') as file:
-            names = [line.strip() for line in file]
-            tried_models = set(names)
-    model_name_set = all_model - tried_models
+    tried_models = []
+    if os.path.exists(os.path.join(log_dir, "cube_compile_2_tried.log")):
+        with open(os.path.join(log_dir, "cube_compile_2_tried.log"), 'r') as file:
+            tried_models = [line.strip() for line in file]
+    model_name_list = [model for model in model_names if model not in tried_models]
     print(f"# already_tried: {len(tried_models)}")
-    print(f"# need_to_try: {len(model_name_set)}")
+    print(f"# need_to_try: {len(model_name_list)}")
 
     model_numbers = 0
-    for model_name in model_name_set:
+    for model_name in model_name_list:
         cube_compile_check(model_name)
         model_numbers += 1
-        logger.info(f"Process: {model_numbers} / {len(model_name_set)}, Percentage: {model_numbers / len(model_name_set) * 100:.2f}%\n\n")
+        logger.info(f"Process: {model_numbers} / {len(model_name_list)}, Percentage: {model_numbers / len(model_name_list) * 100:.2f}%\n\n")
