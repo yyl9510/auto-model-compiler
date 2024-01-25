@@ -1,14 +1,17 @@
 # pip install sentencepiece transformers fuzzywuzzy concurrent-log-handler psutilfrom multiprocessing.managers import ListProxy
 # pip install transformers timeout-decorator
 import warnings
+
+from requests import HTTPError
 warnings.filterwarnings("ignore")
 
 import os
+import subprocess
 import traceback
 from _collections_abc import MutableMapping
 
 import torch
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoModelForCausalLM
 from cube.graph.parser.converter import to_fx_graph
 
 import psutil
@@ -19,6 +22,7 @@ from cube.runtime.utils import microbatches
 import cube
 from examples.utils import get_policy
 import examples.mlp.policy.gallery as gallery
+from fairseq.cube.pas_policies import PASRandomSPMD
 from functools import partial
 import inspect
 
@@ -27,10 +31,12 @@ cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
 
 current_file_path = os.path.abspath(__file__)
 current_folder = os.path.dirname(current_file_path)
-model_name_list_path = os.path.join(current_folder, "models/Natural Language Processing")
+model_name_list_path = os.path.join(current_folder, "models/Test")  # Natural Language Processing
 log_dir = os.path.join(current_folder, "logs")
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
+
+logger_list = []
 
 def setup_logger(log_file, level = logging.INFO, need_timestamp = True):
     # different process has different logger, with timestamp
@@ -43,6 +49,7 @@ def setup_logger(log_file, level = logging.INFO, need_timestamp = True):
             formatter = logging.Formatter('%(asctime)s [PID %(process)d][%(levelname)s]: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
             handler.setFormatter(formatter)
         logger.addHandler(handler)
+    logger_list.append(logger)
     return logger
 
 def logger_redirect(logger1, to_logger_file, prefix = '', need_timestamp=True) -> logging.FileHandler:
@@ -83,17 +90,43 @@ logger_redirect(error_out_cube_logger, os.path.join(log_dir, info_path), "", Fal
 torch.set_printoptions(edgeitems = 2)
 
 cube.init()
-# get policy
-policy = get_policy([gallery], "PASMegatronTP")
-policy = partial(policy, nmicros=64//64, tp_size=2)
+# # get policy
+# policy = get_policy([gallery], "PASRandomSPMD")
+# policy = partial(policy, torch.distributed.get_world_size(), seed=100)
 
-# @timeout_decorator.timeout(120, timeout_exception=TimeoutError)
-def load_model_with_timeout(config, trust_remote_code):
+for tmp_logger in logger_list:
+    if torch.distributed.get_rank() == 0:
+        tmp_logger.setLevel(logging.INFO)
+    else:
+        tmp_logger.setLevel(logging.WARNING)
+
+@timeout_decorator.timeout(120, timeout_exception=TimeoutError)
+def load_model_by_config(config, trust_remote_code):
     torch.manual_seed(0)
     return AutoModel.from_config(config, trust_remote_code=trust_remote_code)
 
+@timeout_decorator.timeout(900, timeout_exception=TimeoutError)
+def load_model_by_pretrain(model_name, cache_dir, trust_remote_code):
+    torch.manual_seed(0)
+    return AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code)
+
+# from transformers import cached_path, WEIGHTS_NAME 
+def load_model(config, model_name, cache_dir):
+    try:
+        model = load_model_by_config(config, trust_remote_code = True)
+    except Exception:
+        try:
+            if torch.distributed.get_rank() == 0:
+                model = load_model_by_pretrain(model_name, cache_dir=cache_dir, trust_remote_code=True)
+            torch.distributed.barrier()
+            model = load_model_by_pretrain(model_name, cache_dir=cache_dir, trust_remote_code=True)
+        except Exception:
+            raise
+        return model
+    return model
+
+
 def print_memory_usage(logger, prefix : str = ""):
-    import subprocess
     process = psutil.Process()
     mem_info = process.memory_info()
     logger.debug("When " + prefix + f": Current memory usage: {mem_info.rss / (1024 ** 3):.2f} GB")
@@ -134,6 +167,78 @@ def check_align(before_trace, after_trace):
                 return False
     return True
 
+from cube.parallel import ComputeConfig
+from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.function.dimops import IRDimops
+from cube.graph.graph import IRGraph
+from cube.graph.segment import IRSegment
+from cube.ir.operator import IRDataOperation, IRFwOperation
+from typing import List, Optional
+import random
+
+def _tp(graph: IRGraph, node: IRDimops, devs: List[int], idx: int, dim: int):
+    sub_nodes = graph.partition(
+        node, node.algorithms('dim'), idx=idx, dim=dim, num=len(devs))
+    for devid, sub_node in zip(devs, sub_nodes):
+        graph.assign(sub_node, devid)
+    return sub_nodes
+
+def _replica(graph: IRGraph, node, devs: List[int]):
+    sub_nodes = graph.replicate(node, times=len(devs))
+    for devid, sub_node in zip(devs, sub_nodes):
+        graph.assign(sub_node, devid)
+    return sub_nodes
+
+from cube.runtime.resource import EnvResource
+
+def PASRandomSPMD(graph: IRGraph, env_resource: EnvResource):
+    """
+    Random SPMD policy
+    """
+    ngpus = env_resource.ngpus
+    # get the current random state
+    state = random.getstate()
+
+    seed = 1
+    # print(f'> set random SPDM policy seed to {seed}')
+    random.seed(seed)
+    devs = list(range(ngpus))
+
+    for ftensor in graph.full_tensors():
+        if ftensor.is_grad(): continue
+        if len(graph.consumers(ftensor)) > 1:
+            graph.multiref(ftensor)
+
+    for node in graph.select(ntype=(IRFwOperation, IRDataOperation)):
+        if node.name == 'multiref' or isinstance(node, IRGraphAnchor):
+            continue
+        if isinstance(node, IRDimops):
+            configs = node.transform_space()
+            if len(configs) == 0:
+                _replica(graph, node, devs)
+            else:
+                configs = sorted(configs, reverse=True,
+                                 key=lambda config: node.input(config[0]).shape[config[1]])
+                random.shuffle(configs)
+                for (idx, dim) in configs:
+                    if node.input(idx).shape[dim] % len(devs) != 0: continue
+                    if node.algorithms('dim').satisfy(idx=idx, dim=dim, num=len(devs)):
+                        # print(f'> partition node {node.name} ({node.cid}) with config idx={idx}, dim={dim}')
+                        _tp(graph, node, devs, idx, dim)
+                        break
+                else:
+                    _replica(graph, node, devs)
+        else:
+            _replica(graph, node, devs)
+
+    # restore the random state
+    random.setstate(state)
+    # print(graph.extra_repr())
+    return graph
+
+# from fairseq.cube.pas_policies import PASRandomSPMD
+# policy = partial(PASRandomSPMD, torch.distributed.get_world_size())
+
 # def trace_worker(model_name: str):
 #     import multiprocessing
 #     p = multiprocessing.Process(target=cube_compile_check, args=(model_name, ))   # , daemon=True
@@ -143,25 +248,48 @@ def check_align(before_trace, after_trace):
 def cube_compile_check(model_name: str):
     try:
         start_time = time.time()
+        if torch.distributed.get_rank() == 0:
+            subprocess.run('rm -rf gencode*.py', shell=True, check=True)
+        # load tokenizer, config, model
         tried_logger.info(f"{model_name}")
 
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
         logger.info(f"{model_name} Tokenizer loaded")
 
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
+        logger.info(f"{model_name} config loaded")
+
+        model = load_model(config, model_name, cache_dir)
+        loaded_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
+        logger.info(f"{model_name} has parameter: {sum(p.numel() for p in model.parameters())}")
+        print_memory_usage(logger, f"after load model {model_name}")
+
+        # build dummy_input and forward
         dummy_input = tokenizer(text, return_tensors="pt")
         if isinstance(dummy_input, MutableMapping):
             dummy_input = dict(dummy_input)
         logger.debug(f"{model_name} tokenized")
         logger.debug(f"dummy_input: {dummy_input}")
+        
+        model.eval()
+        before_trace = model(**dummy_input)
+        logger.debug(f"original logit: {before_trace['last_hidden_state'][:2]}")
 
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
-        logger.info(f"{model_name} config loaded")
+        if (torch.distributed.get_world_size() == 1 and torch.distributed.get_rank() == 0) or \
+            (torch.distributed.get_world_size() > 1 and torch.distributed.get_rank() == 1):
 
-        model = load_model_with_timeout(config, trust_remote_code=True)
-        loaded_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
-        logger.debug(f"{model_name} has parameter: {sum(p.numel() for p in model.parameters())}")
-        print_memory_usage(logger, f"after load model {model_name}")
+            traced_gm = concrete_trace_wrap(model, dummy_input)
+            traced_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
+            traced_gm.eval()
+            after_trace = traced_gm(**dummy_input)
+            logger.debug(f"traced logit: {after_trace['last_hidden_state'][:2]}")
 
+            if check_align(before_trace, after_trace):
+                trace_aligned_logger.info(f"{model_name}, {config.architectures}")
+            else:
+                error_in_cube_logger.error(f"{model_name} not aligned before and after trace\n before trace: {before_trace}\n after trace: {after_trace}\n")
+
+        # cube compile model
         forward_signature = inspect.signature(model.forward)
         if 'decoder_input_ids' in forward_signature.parameters:
             dummy_input['decoder_input_ids'] = dummy_input.get('input_ids', None)
@@ -172,31 +300,16 @@ def cube_compile_check(model_name: str):
         ]
         logger.debug(f"forward_signature: {forward_signature}")
         logger.debug(f"params_with_defaults: {params_with_defaults}")
-
-        model.eval()
-        before_trace = model(**dummy_input)
-        logger.debug(f"original logit: {before_trace['last_hidden_state'][:2]}")
-
-        traced_gm = concrete_trace_wrap(model, dummy_input)
-        traced_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
-        traced_gm.eval()
-        after_trace = traced_gm(**dummy_input)
-        logger.debug(f"traced logit: {after_trace['last_hidden_state'][:2]}")
-
-        if check_align(before_trace, after_trace):
-            trace_aligned_logger.info(f"{model_name}, {config.architectures}")
-        else:
-            error_in_cube_logger.error(f"{model_name} not aligned before and after trace\n before trace: {before_trace}\n after trace: {after_trace}\n")
-
-        # cube compile model
-        model = load_model_with_timeout(config, trust_remote_code=True)
-
         dataloader = microbatches((params_with_defaults, ) * 2)
-        @cube.compile(model, dataloader, PAS=policy)
+        
+        model = load_model(config, model_name, cache_dir)
+        @cube.compile(model, dataloader, PAS=PASRandomSPMD)
         def train_iter(model, dataloader):
             data = next(dataloader)
             logit = model(*data)
             return logit
+
+        # torch.distributed.barrier()
 
         smodel = cube.utils.load_model()
         compiled_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
@@ -209,18 +322,28 @@ def cube_compile_check(model_name: str):
         else:
             error_in_cube_logger.error(f"{model_name} not aligned before trace and after compile\n before trace: {before_trace}\n after trace: {compiled_logit}\n")
 
-    except (Exception, TimeoutError) as e:
-        logger.error(f"fail when trying model: {model_name}", exc_info=False)
-        error_message = traceback.format_exc().strip() + "\n"
-        if 'MagicCube' in error_message:
-            error_in_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
-            error_in_cube_logger.error(error_message)
-        else:
+    except (TimeoutError, HTTPError, OSError, NameError) as e:
+        if torch.distributed.get_rank() == 0:
+            logger.error(f"fail when loading model: {model_name}", exc_info=False)
+            error_message = traceback.format_exc().strip() + "\n"
             error_out_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
             error_out_cube_logger.error(error_message)
+    except Exception as e:
+        if torch.distributed.get_rank() == 0:
+            torch.distributed.barrier()
+
+            logger.error(f"fail when compiling model: {model_name}", exc_info=False)
+            error_message = traceback.format_exc().strip() + "\n"
+            if 'MagicCube' in error_message:
+                error_in_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
+                error_in_cube_logger.error(error_message)
+            else:
+                error_out_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
+                error_out_cube_logger.error(error_message)
     finally:
         end_time = time.time()
         logger.info(f"Finish trying model: {model_name}, time: {end_time - start_time:.2f} s")
+        torch.distributed.barrier()
 
 
 if __name__ == "__main__":
@@ -241,6 +364,7 @@ if __name__ == "__main__":
     print(f"# need_to_try: {len(model_name_list)}")
 
     model_numbers = 0
+    torch.distributed.barrier()
     for model_name in model_name_list:
         cube_compile_check(model_name)
         model_numbers += 1
