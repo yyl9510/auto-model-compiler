@@ -31,7 +31,7 @@ cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
 
 current_file_path = os.path.abspath(__file__)
 current_folder = os.path.dirname(current_file_path)
-model_name_list_path = os.path.join(current_folder, "models/Test")  # Natural Language Processing
+model_name_list_path = os.path.join(current_folder, "models/Natural Language Processing")  # Natural Language Processing
 log_dir = os.path.join(current_folder, "logs")
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
@@ -100,30 +100,47 @@ for tmp_logger in logger_list:
     else:
         tmp_logger.setLevel(logging.WARNING)
 
-@timeout_decorator.timeout(120, timeout_exception=TimeoutError)
-def load_model_by_config(config, trust_remote_code):
+# @timeout_decorator.timeout(60, timeout_exception=TimeoutError)
+def load_model_by_config(config, trust_remote_code = True):
     torch.manual_seed(0)
     return AutoModel.from_config(config, trust_remote_code=trust_remote_code)
 
-@timeout_decorator.timeout(900, timeout_exception=TimeoutError)
-def load_model_by_pretrain(model_name, cache_dir, trust_remote_code):
+# @timeout_decorator.timeout(10, timeout_exception=TimeoutError)
+def load_model_by_pretrain(model_name, cache_dir, trust_remote_code = True):
     torch.manual_seed(0)
     return AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code)
 
 # from transformers import cached_path, WEIGHTS_NAME 
 def load_model(config, model_name, cache_dir):
     try:
-        model = load_model_by_config(config, trust_remote_code = True)
-    except Exception:
-        try:
-            if torch.distributed.get_rank() == 0:
-                model = load_model_by_pretrain(model_name, cache_dir=cache_dir, trust_remote_code=True)
-            torch.distributed.barrier()
-            model = load_model_by_pretrain(model_name, cache_dir=cache_dir, trust_remote_code=True)
-        except Exception:
-            raise
+        model = load_model_by_config(config)
         return model
-    return model
+    except Exception:
+        logger.info("logging by config failed, try from_pretrained")
+        error_message = traceback.format_exc().strip() + "\n"
+        logger.error(error_message)
+        try:
+            # if torch.distributed.get_rank() == 0:
+            #     logger.info("cache by rank 0")
+            #     success_flag = torch.tensor([1])
+            #     model = load_model_by_pretrain(model_name, cache_dir=cache_dir)
+            #     logger.info("pretrained weight cached")
+            # else:
+            #     success_flag = torch.tensor([0])
+            # torch.distributed.broadcast(success_flag, src=0)
+            # torch.distributed.barrier()
+            # if success_flag.item() == 1:
+            model = load_model_by_pretrain(model_name, cache_dir=cache_dir)
+            # else:
+            #     raise RuntimeError(f"{model_name} not loaded successfully")
+            return model
+        except Exception:
+            logger.info("logging by pretrain failed, exit loading")
+            error_message = traceback.format_exc().strip() + "\n"
+            logger.error(error_message)
+            raise
+        
+    
 
 
 def print_memory_usage(logger, prefix : str = ""):
@@ -249,9 +266,8 @@ def cube_compile_check(model_name: str):
     try:
         start_time = time.time()
         if torch.distributed.get_rank() == 0:
-            subprocess.run('rm -rf gencode*.py', shell=True, check=True)
+            subprocess.run('rm -rf gencode*.py fullmodel.pt.* dist_param_map.pt', shell=True, check=True)
         # load tokenizer, config, model
-        tried_logger.info(f"{model_name}")
 
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
         logger.info(f"{model_name} Tokenizer loaded")
@@ -273,7 +289,7 @@ def cube_compile_check(model_name: str):
         
         model.eval()
         before_trace = model(**dummy_input)
-        logger.debug(f"original logit: {before_trace['last_hidden_state'][:2]}")
+        # logger.debug(f"original logit: {before_trace['last_hidden_state'][:2]}")
 
         if (torch.distributed.get_world_size() == 1 and torch.distributed.get_rank() == 0) or \
             (torch.distributed.get_world_size() > 1 and torch.distributed.get_rank() == 1):
@@ -282,7 +298,7 @@ def cube_compile_check(model_name: str):
             traced_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
             traced_gm.eval()
             after_trace = traced_gm(**dummy_input)
-            logger.debug(f"traced logit: {after_trace['last_hidden_state'][:2]}")
+            # logger.debug(f"traced logit: {after_trace['last_hidden_state'][:2]}")
 
             if check_align(before_trace, after_trace):
                 trace_aligned_logger.info(f"{model_name}, {config.architectures}")
@@ -322,7 +338,7 @@ def cube_compile_check(model_name: str):
         else:
             error_in_cube_logger.error(f"{model_name} not aligned before trace and after compile\n before trace: {before_trace}\n after trace: {compiled_logit}\n")
 
-    except (TimeoutError, HTTPError, OSError, NameError) as e:
+    except (TimeoutError, HTTPError, OSError, NameError, RuntimeError, KeyError) as e:
         if torch.distributed.get_rank() == 0:
             logger.error(f"fail when loading model: {model_name}", exc_info=False)
             error_message = traceback.format_exc().strip() + "\n"
@@ -342,6 +358,7 @@ def cube_compile_check(model_name: str):
                 error_out_cube_logger.error(error_message)
     finally:
         end_time = time.time()
+        tried_logger.info(f"{model_name}")
         logger.info(f"Finish trying model: {model_name}, time: {end_time - start_time:.2f} s")
         torch.distributed.barrier()
 
