@@ -27,7 +27,7 @@ from functools import partial
 import inspect
 
 text: str = "Huggingface is a really excellent project!"
-cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
+cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache2"
 
 current_file_path = os.path.abspath(__file__)
 current_folder = os.path.dirname(current_file_path)
@@ -100,12 +100,12 @@ for tmp_logger in logger_list:
     else:
         tmp_logger.setLevel(logging.WARNING)
 
-# @timeout_decorator.timeout(60, timeout_exception=TimeoutError)
+@timeout_decorator.timeout(180, timeout_exception=TimeoutError)
 def load_model_by_config(config, trust_remote_code = True):
     torch.manual_seed(0)
     return AutoModel.from_config(config, trust_remote_code=trust_remote_code)
 
-# @timeout_decorator.timeout(10, timeout_exception=TimeoutError)
+@timeout_decorator.timeout(600, timeout_exception=TimeoutError)
 def load_model_by_pretrain(model_name, cache_dir, trust_remote_code = True):
     torch.manual_seed(0)
     return AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code)
@@ -113,10 +113,10 @@ def load_model_by_pretrain(model_name, cache_dir, trust_remote_code = True):
 # from transformers import cached_path, WEIGHTS_NAME 
 def load_model(config, model_name, cache_dir):
     try:
-        model = load_model_by_config(config)
+        model = load_model_by_pretrain(model_name, cache_dir=cache_dir)
         return model
     except Exception:
-        logger.info("logging by config failed, try from_pretrained")
+        logger.info("logging by pretrain failed, try by_config")
         error_message = traceback.format_exc().strip() + "\n"
         logger.error(error_message)
         try:
@@ -130,16 +130,16 @@ def load_model(config, model_name, cache_dir):
             # torch.distributed.broadcast(success_flag, src=0)
             # torch.distributed.barrier()
             # if success_flag.item() == 1:
-            model = load_model_by_pretrain(model_name, cache_dir=cache_dir)
+            model = load_model_by_config(config)
             # else:
             #     raise RuntimeError(f"{model_name} not loaded successfully")
             return model
         except Exception:
-            logger.info("logging by pretrain failed, exit loading")
+            logger.info("logging by config failed, exit loading")
             error_message = traceback.format_exc().strip() + "\n"
             logger.error(error_message)
             raise
-        
+
     
 
 
