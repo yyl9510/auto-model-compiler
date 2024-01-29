@@ -100,15 +100,15 @@ for tmp_logger in logger_list:
     else:
         tmp_logger.setLevel(logging.WARNING)
 
-@timeout_decorator.timeout(180, timeout_exception=TimeoutError)
+# @timeout_decorator.timeout(180, timeout_exception=TimeoutError)
 def load_model_by_config(config, trust_remote_code = True):
     torch.manual_seed(0)
     return AutoModel.from_config(config, trust_remote_code=trust_remote_code)
 
-@timeout_decorator.timeout(600, timeout_exception=TimeoutError)
+# @timeout_decorator.timeout(600, timeout_exception=TimeoutError)
 def load_model_by_pretrain(model_name, cache_dir, trust_remote_code = True):
     torch.manual_seed(0)
-    return AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code)
+    return AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code, resume_download = True)
 
 # from transformers import cached_path, WEIGHTS_NAME 
 def load_model(config, model_name, cache_dir):
@@ -268,6 +268,7 @@ def cube_compile_check(model_name: str):
         if torch.distributed.get_rank() == 0:
             subprocess.run('rm -rf gencode*.py fullmodel.pt.* dist_param_map.pt', shell=True, check=True)
         # load tokenizer, config, model
+        tried_logger.info(f"{model_name}")
 
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
         logger.info(f"{model_name} Tokenizer loaded")
@@ -331,7 +332,7 @@ def cube_compile_check(model_name: str):
         compiled_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
         smodel.eval()
         compiled_logit = train_iter(smodel, dataloader)
-        logger.debug(f"compiled logit: {compiled_logit['last_hidden_state'][:2]}")
+        # logger.debug(f"compiled logit: {compiled_logit['last_hidden_state'][:2]}")
 
         if check_align(before_trace, compiled_logit):
             aligned_logger.info(f"aligned before trace and after compile: {model_name}, {config.architectures}")
@@ -358,7 +359,6 @@ def cube_compile_check(model_name: str):
                 error_out_cube_logger.error(error_message)
     finally:
         end_time = time.time()
-        tried_logger.info(f"{model_name}")
         logger.info(f"Finish trying model: {model_name}, time: {end_time - start_time:.2f} s")
         torch.distributed.barrier()
 
