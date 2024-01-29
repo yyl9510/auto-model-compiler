@@ -399,6 +399,12 @@ if __name__ == "__main__":
     print(f"# already_tried: {len(tried_models)}")
     print(f"# need_to_try: {len(model_name_list)}")
 
+    import json
+    with open(os.path.join(log_dir, "error_out_cube.json"), 'r') as json_file:
+        error_out_cube_dict = json.load(json_file)
+    with open(os.path.join(log_dir, "error_in_cube.json"), 'r') as json_file:
+        error_in_cube_dict = json.load(json_file)
+
     model_numbers = 0
     torch.distributed.barrier()
     for model_name in model_name_list:
