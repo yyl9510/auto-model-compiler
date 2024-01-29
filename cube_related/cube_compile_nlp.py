@@ -22,16 +22,17 @@ from cube.runtime.utils import microbatches
 import cube
 from examples.utils import get_policy
 import examples.mlp.policy.gallery as gallery
-from fairseq.cube.pas_policies import PASRandomSPMD
+# from fairseq.cube.pas_policies import PASRandomSPMD
 from functools import partial
 import inspect
 
 text: str = "Huggingface is a really excellent project!"
-cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache2"
+cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
+
 
 current_file_path = os.path.abspath(__file__)
 current_folder = os.path.dirname(current_file_path)
-model_name_list_path = os.path.join(current_folder, "models/Natural Language Processing")  # Natural Language Processing
+model_name_list_path = os.path.join(current_folder, "models/Test")  # Natural Language Processing
 log_dir = os.path.join(current_folder, "logs")
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
@@ -87,6 +88,7 @@ error_in_cube_logger = setup_logger(os.path.join(log_dir, f'cube_compile_9_error
 logger_redirect(error_in_cube_logger, os.path.join(log_dir, info_path), "", False)
 logger_redirect(error_out_cube_logger, os.path.join(log_dir, info_path), "", False)
 
+
 torch.set_printoptions(edgeitems = 2)
 
 cube.init()
@@ -100,12 +102,12 @@ for tmp_logger in logger_list:
     else:
         tmp_logger.setLevel(logging.WARNING)
 
-# @timeout_decorator.timeout(180, timeout_exception=TimeoutError)
+@timeout_decorator.timeout(30, timeout_exception=TimeoutError)
 def load_model_by_config(config, trust_remote_code = True):
     torch.manual_seed(0)
     return AutoModel.from_config(config, trust_remote_code=trust_remote_code)
 
-# @timeout_decorator.timeout(600, timeout_exception=TimeoutError)
+@timeout_decorator.timeout(120, timeout_exception=TimeoutError)
 def load_model_by_pretrain(model_name, cache_dir, trust_remote_code = True):
     torch.manual_seed(0)
     return AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code, resume_download = True)
@@ -113,35 +115,20 @@ def load_model_by_pretrain(model_name, cache_dir, trust_remote_code = True):
 # from transformers import cached_path, WEIGHTS_NAME 
 def load_model(config, model_name, cache_dir):
     try:
-        model = load_model_by_pretrain(model_name, cache_dir=cache_dir)
+        model = load_model_by_config(config)
         return model
     except Exception:
-        logger.info("logging by pretrain failed, try by_config")
+        logger.info("logging by config failed, try by pretrain")
         error_message = traceback.format_exc().strip() + "\n"
         logger.error(error_message)
         try:
-            # if torch.distributed.get_rank() == 0:
-            #     logger.info("cache by rank 0")
-            #     success_flag = torch.tensor([1])
-            #     model = load_model_by_pretrain(model_name, cache_dir=cache_dir)
-            #     logger.info("pretrained weight cached")
-            # else:
-            #     success_flag = torch.tensor([0])
-            # torch.distributed.broadcast(success_flag, src=0)
-            # torch.distributed.barrier()
-            # if success_flag.item() == 1:
-            model = load_model_by_config(config)
-            # else:
-            #     raise RuntimeError(f"{model_name} not loaded successfully")
+            model = load_model_by_pretrain(model_name, cache_dir=cache_dir)
             return model
         except Exception:
-            logger.info("logging by config failed, exit loading")
+            logger.info("logging by pretrain failed, exit loading")
             error_message = traceback.format_exc().strip() + "\n"
             logger.error(error_message)
             raise
-
-    
-
 
 def print_memory_usage(logger, prefix : str = ""):
     process = psutil.Process()
@@ -167,9 +154,8 @@ def concrete_trace_wrap(model, dummy_input):
     if torch.cuda.is_available():
         try:
             traced_gm = to_fx_graph(model, dummy_input)
-
         except:
-            raise Exception("Failed to trace with gpu")
+            raise
         print("Successfully traced with gpu")
         return traced_gm
     else:
@@ -342,26 +328,59 @@ def cube_compile_check(model_name: str):
     except (TimeoutError, HTTPError, OSError, NameError, RuntimeError, KeyError) as e:
         if torch.distributed.get_rank() == 0:
             logger.error(f"fail when loading model: {model_name}", exc_info=False)
+
             error_message = traceback.format_exc().strip() + "\n"
             error_out_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
             error_out_cube_logger.error(error_message)
+            summarize_error(model_name, error_out_cube_dict, os.path.join(log_dir, "error_out_cube.json"))
     except Exception as e:
         if torch.distributed.get_rank() == 0:
             torch.distributed.barrier()
 
             logger.error(f"fail when compiling model: {model_name}", exc_info=False)
+
             error_message = traceback.format_exc().strip() + "\n"
             if 'MagicCube' in error_message:
                 error_in_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
                 error_in_cube_logger.error(error_message)
+                summarize_error(model_name, error_in_cube_dict, os.path.join(log_dir, "error_in_cube.json"))
             else:
                 error_out_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
                 error_out_cube_logger.error(error_message)
+                summarize_error(model_name, error_out_cube_dict, os.path.join(log_dir, "error_out_cube.json"))
     finally:
         end_time = time.time()
         logger.info(f"Finish trying model: {model_name}, time: {end_time - start_time:.2f} s")
         torch.distributed.barrier()
 
+error_out_cube_dict = {} # error_type: [model_name]
+error_in_cube_dict = {}
+
+def summarize_error(model_name, error_dict, log_path):
+    import sys
+    import json
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    first_line = f"{exc_type.__name__}: {exc_value}"
+    first_line = first_line.replace(model_name, r"{model_name}")
+    # print(f"first line is: {first_line}")
+    
+    # formatted_exception = traceback.format_exception(exc_type, exc_value, exc_traceback)
+    # exception_string = ''.join(formatted_exception).strip() + "\n"
+    # print(f"original error is:\n {exception_string}")
+
+    if first_line in error_dict:
+        error_dict[first_line]['model_name'].append(model_name)
+        error_dict[first_line]['count'] += 1
+    else:
+        error_dict[first_line] = {"count": 1, 'model_name': [model_name]}   #, "example": exception_string
+    
+    error_dict = dict(sorted(error_dict.items(), key=lambda item: item[1]["count"], reverse=True))
+    
+    with open(log_path, 'w') as json_file:
+        json.dump(error_dict, json_file, indent=4)
+
+    # with open('error_dict.json', 'r') as json_file:  
+    #     loaded_error_dict = json.load(json_file)  
 
 if __name__ == "__main__":
     model_names = []
