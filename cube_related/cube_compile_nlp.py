@@ -1,11 +1,17 @@
-# pip install sentencepiece transformers fuzzywuzzy concurrent-log-handler psutilfrom multiprocessing.managers import ListProxy
-# pip install transformers timeout-decorator
+# pip install sentencepiece transformers fuzzywuzzy concurrent-log-handler psutil protobuf
+# pip install transformers timeout-decorator protobuf sacremoses
 import warnings
 
 from requests import HTTPError
 warnings.filterwarnings("ignore")
 
 import os
+current_file_path = os.path.abspath(__file__)
+current_folder = os.path.dirname(current_file_path)
+log_dir = os.path.join(current_folder, "logs")
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
 import subprocess
 import traceback
 from _collections_abc import MutableMapping
@@ -18,8 +24,8 @@ import psutil
 import logging
 import time
 import timeout_decorator
-from cube.runtime.utils import microbatches
 import cube
+from cube.runtime.utils import microbatches
 from examples.utils import get_policy
 import examples.mlp.policy.gallery as gallery
 # from fairseq.cube.pas_policies import PASRandomSPMD
@@ -28,14 +34,8 @@ import inspect
 
 text: str = "Huggingface is a really excellent project!"
 cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
-
-
-current_file_path = os.path.abspath(__file__)
-current_folder = os.path.dirname(current_file_path)
 model_name_list_path = os.path.join(current_folder, "models/Test")  # Natural Language Processing
-log_dir = os.path.join(current_folder, "logs")
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
+
 
 logger_list = []
 
@@ -73,14 +73,14 @@ loaded_logger = setup_logger(os.path.join(log_dir, f'cube_compile_3_loaded.log')
 traced_logger = setup_logger(os.path.join(log_dir, f'cube_compile_4_traced.log'), loglevel, False)
 trace_aligned_logger = setup_logger(os.path.join(log_dir, f'cube_compile_5_trace_aligned.log'), loglevel, False)
 compiled_logger = setup_logger(os.path.join(log_dir, f'cube_compile_6_compiled.log'), loglevel, False)
-aligned_logger = setup_logger(os.path.join(log_dir, f'cube_compile_7_compile_aligned.log'), loglevel, False)
+compile_aligned_logger = setup_logger(os.path.join(log_dir, f'cube_compile_7_compile_aligned.log'), loglevel, False)
 
 logger_redirect(tried_logger, os.path.join(log_dir, info_path), prefix="model tried: ")
 logger_redirect(loaded_logger, os.path.join(log_dir, info_path), prefix="model loaded: ")
 logger_redirect(traced_logger, os.path.join(log_dir, info_path), prefix="model traced: ")
 logger_redirect(trace_aligned_logger, os.path.join(log_dir, info_path), prefix="model trace aligned: ")
 logger_redirect(compiled_logger, os.path.join(log_dir, info_path), prefix="model compiled: ")
-logger_redirect(aligned_logger, os.path.join(log_dir, info_path), prefix="model aligned: ")
+logger_redirect(compile_aligned_logger, os.path.join(log_dir, info_path), prefix="model compile aligned: ")
 
 error_out_cube_logger = setup_logger(os.path.join(log_dir, f'cube_compile_8_error_out_cube.log'), loglevel)
 error_in_cube_logger = setup_logger(os.path.join(log_dir, f'cube_compile_9_error_in_cube.log'), loglevel)
@@ -102,12 +102,12 @@ for tmp_logger in logger_list:
     else:
         tmp_logger.setLevel(logging.WARNING)
 
-@timeout_decorator.timeout(30, timeout_exception=TimeoutError)
+# @timeout_decorator.timeout(30, timeout_exception=TimeoutError)
 def load_model_by_config(config, trust_remote_code = True):
     torch.manual_seed(0)
     return AutoModel.from_config(config, trust_remote_code=trust_remote_code)
 
-@timeout_decorator.timeout(120, timeout_exception=TimeoutError)
+# @timeout_decorator.timeout(120, timeout_exception=TimeoutError)
 def load_model_by_pretrain(model_name, cache_dir, trust_remote_code = True):
     torch.manual_seed(0)
     return AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code, resume_download = True)
@@ -118,17 +118,38 @@ def load_model(config, model_name, cache_dir):
         model = load_model_by_config(config)
         return model
     except Exception:
-        logger.info("logging by config failed, try by pretrain")
+        logger.info("loading by config failed, try by pretrain")
         error_message = traceback.format_exc().strip() + "\n"
         logger.error(error_message)
         try:
             model = load_model_by_pretrain(model_name, cache_dir=cache_dir)
             return model
         except Exception:
-            logger.info("logging by pretrain failed, exit loading")
+            logger.info("loading by pretrain failed, exit loading")
             error_message = traceback.format_exc().strip() + "\n"
             logger.error(error_message)
             raise
+
+def load_tokenizer(model_name, cache_dir, trust_remote_code = True):
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code)
+        return tokenizer
+    except OSError:
+        # there is seven different tokenizers, but only one is used in this script, because we don't care about the performance here
+        # CamembertTokenizerFast tokenizer
+        # XLMRobertaTokenizerFast tokenizer
+        # DistilBertTokenizerFast tokenizer
+        # T5TokenizerFast tokenizer
+        # RobertaTokenizerFast tokenizer  
+        # GPT2TokenizerFast tokenizer
+        # BertTokenizerFast
+        logger.debug("loading pretrained tokenizer failed, use bert-base-uncased tokenizer instead")
+        from transformers import BertTokenizerFast  
+        return BertTokenizerFast.from_pretrained('bert-base-uncased', cache_dir=cache_dir, trust_remote_code=trust_remote_code)
+    except Exception:
+        error_message = traceback.format_exc().strip() + "\n"
+        logger.error(error_message)
+        raise
 
 def print_memory_usage(logger, prefix : str = ""):
     process = psutil.Process()
@@ -256,11 +277,11 @@ def cube_compile_check(model_name: str):
         # load tokenizer, config, model
         tried_logger.info(f"{model_name}")
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
-        logger.info(f"{model_name} Tokenizer loaded")
-
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
         logger.info(f"{model_name} config loaded")
+
+        tokenizer = load_tokenizer(model_name, cache_dir=cache_dir)
+        logger.info(f"{model_name} Tokenizer loaded")
 
         model = load_model(config, model_name, cache_dir)
         loaded_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
@@ -271,6 +292,9 @@ def cube_compile_check(model_name: str):
         dummy_input = tokenizer(text, return_tensors="pt")
         if isinstance(dummy_input, MutableMapping):
             dummy_input = dict(dummy_input)
+        forward_signature = inspect.signature(model.forward)
+        if 'decoder_input_ids' in forward_signature.parameters:
+            dummy_input['decoder_input_ids'] = dummy_input.get('input_ids', None)
         logger.debug(f"{model_name} tokenized")
         logger.debug(f"dummy_input: {dummy_input}")
         
@@ -293,9 +317,6 @@ def cube_compile_check(model_name: str):
                 error_in_cube_logger.error(f"{model_name} not aligned before and after trace\n before trace: {before_trace}\n after trace: {after_trace}\n")
 
         # cube compile model
-        forward_signature = inspect.signature(model.forward)
-        if 'decoder_input_ids' in forward_signature.parameters:
-            dummy_input['decoder_input_ids'] = dummy_input.get('input_ids', None)
         params_with_defaults = [
             v.default if k not in dummy_input else dummy_input[k].to(torch.cuda.current_device())
             for k, v in forward_signature.parameters.items()
@@ -321,7 +342,7 @@ def cube_compile_check(model_name: str):
         # logger.debug(f"compiled logit: {compiled_logit['last_hidden_state'][:2]}")
 
         if check_align(before_trace, compiled_logit):
-            aligned_logger.info(f"aligned before trace and after compile: {model_name}, {config.architectures}")
+            compile_aligned_logger.info(f"{model_name}, {config.architectures}")
         else:
             error_in_cube_logger.error(f"{model_name} not aligned before trace and after compile\n before trace: {before_trace}\n after trace: {compiled_logit}\n")
 
@@ -400,14 +421,18 @@ if __name__ == "__main__":
     print(f"# need_to_try: {len(model_name_list)}")
 
     import json
-    with open(os.path.join(log_dir, "error_out_cube.json"), 'r') as json_file:
-        error_out_cube_dict = json.load(json_file)
-    with open(os.path.join(log_dir, "error_in_cube.json"), 'r') as json_file:
-        error_in_cube_dict = json.load(json_file)
+    if os.path.exists(os.path.join(log_dir, "error_out_cube.json")):
+        with open(os.path.join(log_dir, "error_out_cube.json"), 'r') as json_file:
+            error_out_cube_dict = json.load(json_file)
+    if os.path.exists(os.path.join(log_dir, "error_in_cube.json")):
+        with open(os.path.join(log_dir, "error_in_cube.json"), 'r') as json_file:
+            error_in_cube_dict = json.load(json_file)
 
     model_numbers = 0
     torch.distributed.barrier()
     for model_name in model_name_list:
+        with open(os.path.expanduser('~/workspace/auto-model-compiler/cube_related/logs/FxModuleParser_Warning.log') , 'a') as file:  
+            file.write(f"\n{model_name}\n")
         cube_compile_check(model_name)
         model_numbers += 1
         logger.info(f"Process: {model_numbers} / {len(model_name_list)}, Percentage: {model_numbers / len(model_name_list) * 100:.2f}%\n\n")
