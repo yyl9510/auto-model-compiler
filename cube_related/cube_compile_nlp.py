@@ -26,16 +26,33 @@ import time
 import timeout_decorator
 import cube
 from cube.runtime.utils import microbatches
-from examples.utils import get_policy
-import examples.mlp.policy.gallery as gallery
-# from fairseq.cube.pas_policies import PASRandomSPMD
-from functools import partial
+from typing import List
+
 import inspect
+from cube.graph.function.anchor import IRGraphAnchor
+from cube.graph.function.dimops import IRDimops
+from cube.graph.graph import IRGraph
+from cube.ir.operator import IRDataOperation, IRFwOperation
+import random
+
+torch.set_printoptions(edgeitems = 2)
+
+cube.init()
+
+# from cube.parallel import ComputeConfig
+# from cube.graph.segment import IRSegment
+# from examples.utils import get_policy
+# import examples.mlp.policy.gallery as gallery
+# from functools import partial
 
 text: str = "Huggingface is a really excellent project!"
 cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
-model_name_list_path = os.path.join(current_folder, "models/Test")  # Natural Language Processing
+model_name_list_path = os.path.join(current_folder, "models/test")  # Natural Language Processing
+LOAD_MODEL_TIMEOUT = True
+error_out_cube_dict = {} # error_type: [model_name]
+error_in_cube_dict = {}
 
+loglevel = logging.INFO
 
 logger_list = []
 
@@ -64,7 +81,7 @@ def logger_redirect(logger1, to_logger_file, prefix = '', need_timestamp=True) -
     logger1.addHandler(result_handler)
     return result_handler
 
-loglevel = logging.INFO
+
 info_path = os.path.join(log_dir, f'cube_compile_1_info.log')
 logger = setup_logger(os.path.join(log_dir, info_path), loglevel)
 
@@ -88,68 +105,60 @@ error_in_cube_logger = setup_logger(os.path.join(log_dir, f'cube_compile_9_error
 logger_redirect(error_in_cube_logger, os.path.join(log_dir, info_path), "", False)
 logger_redirect(error_out_cube_logger, os.path.join(log_dir, info_path), "", False)
 
-
-torch.set_printoptions(edgeitems = 2)
-
-cube.init()
-# # get policy
-# policy = get_policy([gallery], "PASRandomSPMD")
-# policy = partial(policy, torch.distributed.get_world_size(), seed=100)
-
 for tmp_logger in logger_list:
     if torch.distributed.get_rank() == 0:
         tmp_logger.setLevel(logging.INFO)
     else:
         tmp_logger.setLevel(logging.WARNING)
 
-# @timeout_decorator.timeout(30, timeout_exception=TimeoutError)
-def load_model_by_config(config, trust_remote_code = True):
-    torch.manual_seed(0)
-    return AutoModel.from_config(config, trust_remote_code=trust_remote_code)
+def conditional_timeout_decorator(condition, timeout_time=30):
+    def decorator(func):
+        if condition:
+            return timeout_decorator.timeout(timeout_time)(func)
+        else:
+            return func
+    return decorator
 
-# @timeout_decorator.timeout(120, timeout_exception=TimeoutError)
-def load_model_by_pretrain(model_name, cache_dir, trust_remote_code = True):
+@conditional_timeout_decorator(condition=LOAD_MODEL_TIMEOUT, timeout_time=30)
+def load_model_from_config(config):  
     torch.manual_seed(0)
-    return AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code, resume_download = True)
+    return AutoModel.from_config(config, trust_remote_code=True)
+
+@conditional_timeout_decorator(condition=LOAD_MODEL_TIMEOUT, timeout_time=120)
+def load_model_from_pretrain(model_name, cache_dir, resume_download = True):
+    torch.manual_seed(0)
+    return AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, resume_download = resume_download, trust_remote_code=True)
+
 
 # from transformers import cached_path, WEIGHTS_NAME 
-def load_model(config, model_name, cache_dir):
+def load_hf_model(config, model_name, cache_dir, resume_download = True):
     try:
-        model = load_model_by_config(config)
+        model = load_model_from_config(config)
         return model
     except Exception:
-        logger.info("loading by config failed, try by pretrain")
-        error_message = traceback.format_exc().strip() + "\n"
-        logger.error(error_message)
+        logger.info("load model from config failed, try by pretrain")
+        # error_message = traceback.format_exc().strip() + "\n"
+        # logger.error(error_message)
         try:
-            model = load_model_by_pretrain(model_name, cache_dir=cache_dir)
+            model = load_model_from_pretrain(model_name, cache_dir=cache_dir, resume_download=resume_download)
             return model
         except Exception:
-            logger.info("loading by pretrain failed, exit loading")
-            error_message = traceback.format_exc().strip() + "\n"
-            logger.error(error_message)
+            logger.info("load model from pretrain failed, exit loading")
+            # error_message = traceback.format_exc().strip() + "\n"
+            # logger.error(error_message)
             raise
 
-def load_tokenizer(model_name, cache_dir, trust_remote_code = True):
+def load_hf_nlp_tokenizer(model_name, cache_dir):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=trust_remote_code)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=True)
         return tokenizer
     except OSError:
-        # there is seven different tokenizers, but only one is used in this script, because we don't care about the performance here
-        # CamembertTokenizerFast tokenizer
-        # XLMRobertaTokenizerFast tokenizer
-        # DistilBertTokenizerFast tokenizer
-        # T5TokenizerFast tokenizer
-        # RobertaTokenizerFast tokenizer  
-        # GPT2TokenizerFast tokenizer
-        # BertTokenizerFast
+        # The script uses just one of the seven tokenizers below, as we're only checking if the logits match for the same input.
+        # BertTokenizerFast, CamembertTokenizerFast tokenizer, XLMRobertaTokenizerFast tokenizer, DistilBertTokenizerFast tokenizer
+        # T5TokenizerFast tokenizer, RobertaTokenizerFast tokenizer, GPT2TokenizerFast tokenizer
         logger.debug("loading pretrained tokenizer failed, use bert-base-uncased tokenizer instead")
         from transformers import BertTokenizerFast  
-        return BertTokenizerFast.from_pretrained('bert-base-uncased', cache_dir=cache_dir, trust_remote_code=trust_remote_code)
-    except Exception:
-        error_message = traceback.format_exc().strip() + "\n"
-        logger.error(error_message)
-        raise
+        return BertTokenizerFast.from_pretrained('bert-base-uncased', cache_dir=cache_dir, trust_remote_code=True)
 
 def print_memory_usage(logger, prefix : str = ""):
     process = psutil.Process()
@@ -191,15 +200,6 @@ def check_align(before_trace, after_trace):
                 return False
     return True
 
-from cube.parallel import ComputeConfig
-from cube.graph.function.anchor import IRGraphAnchor
-from cube.graph.function.dimops import IRDimops
-from cube.graph.graph import IRGraph
-from cube.graph.segment import IRSegment
-from cube.ir.operator import IRDataOperation, IRFwOperation
-from typing import List, Optional
-import random
-
 def _tp(graph: IRGraph, node: IRDimops, devs: List[int], idx: int, dim: int):
     sub_nodes = graph.partition(
         node, node.algorithms('dim'), idx=idx, dim=dim, num=len(devs))
@@ -214,7 +214,6 @@ def _replica(graph: IRGraph, node, devs: List[int]):
     return sub_nodes
 
 from cube.runtime.resource import EnvResource
-
 def PASRandomSPMD(graph: IRGraph, env_resource: EnvResource):
     """
     Random SPMD policy
@@ -260,16 +259,58 @@ def PASRandomSPMD(graph: IRGraph, env_resource: EnvResource):
     # print(graph.extra_repr())
     return graph
 
-# from fairseq.cube.pas_policies import PASRandomSPMD
-# policy = partial(PASRandomSPMD, torch.distributed.get_world_size())
+def _prepare_nlp_input(model, dummy_input):
+    if isinstance(dummy_input, MutableMapping):
+        dummy_input = dict(dummy_input)
+    assert isinstance(dummy_input, dict)
+    forward_signature = inspect.signature(model.forward)
+    if 'decoder_input_ids' in forward_signature.parameters and 'decoder_input_ids' not in dummy_input:
+        dummy_input['decoder_input_ids'] = dummy_input.get('input_ids', None)
+    return dummy_input
 
-# def trace_worker(model_name: str):
-#     import multiprocessing
-#     p = multiprocessing.Process(target=cube_compile_check, args=(model_name, ))   # , daemon=True
-#     p.start()
-#     p.join()
+def prepare_dataloader(model, dummy_input):
+    forward_signature = inspect.signature(model.forward)
+    params_with_defaults = [
+        v.default if k not in dummy_input else dummy_input[k].to(torch.cuda.current_device())
+        for k, v in forward_signature.parameters.items()
+        if v.default is not inspect.Parameter.empty
+    ]
+    # logger.debug(f"forward_signature: {forward_signature}")
+    # logger.debug(f"params_with_defaults: {params_with_defaults}")
+    dataloader = microbatches((params_with_defaults, ) * 2)
+    return dataloader
 
-def cube_compile_check(model_name: str):
+def trace_forward_check(model: torch.nn.Module, dummy_input: dict, before_trace: dict):
+    traced_gm = concrete_trace_wrap(model, dummy_input)
+    traced_logger.info(f"{model_name}")
+    traced_gm.eval()
+    after_trace = traced_gm(**dummy_input)
+    # logger.debug(f"traced logit: {after_trace['last_hidden_state'][:2]}")
+
+    if check_align(before_trace, after_trace):
+        trace_aligned_logger.info(f"{model_name}")
+    else:
+        error_in_cube_logger.error(f"{model_name} not aligned before and after trace\n before trace: {before_trace}\n after trace: {after_trace}\n")
+
+def compile_forward_check(model: torch.nn.Module, dummy_input: dict, before_trace: dict, policy = PASRandomSPMD):
+    dataloader = prepare_dataloader(model, dummy_input)
+    @cube.compile(model, dataloader, PAS=policy)
+    def train_iter(model, dataloader):
+        data = next(dataloader)
+        logit = model(*data)
+        return logit
+
+    smodel = cube.utils.load_model()
+    compiled_logger.info(f"{model_name}")
+    smodel.eval()
+    compiled_logit = train_iter(smodel, dataloader)
+
+    if check_align(before_trace, compiled_logit):
+        compile_aligned_logger.info(f"{model_name}")
+    else:
+        error_in_cube_logger.error(f"{model_name} not aligned before trace and after compile\n before trace: {before_trace}\n after trace: {compiled_logit}\n")
+
+def compile_hf_nlp_worker(model_name: str, do_trace = True, do_compile = True):
     try:
         start_time = time.time()
         if torch.distributed.get_rank() == 0:
@@ -277,74 +318,29 @@ def cube_compile_check(model_name: str):
         # load tokenizer, config, model
         tried_logger.info(f"{model_name}")
 
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
+        config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
         logger.info(f"{model_name} config loaded")
 
-        tokenizer = load_tokenizer(model_name, cache_dir=cache_dir)
+        tokenizer = load_hf_nlp_tokenizer(model_name, cache_dir=cache_dir)
         logger.info(f"{model_name} Tokenizer loaded")
 
-        model = load_model(config, model_name, cache_dir)
+        model = load_hf_model(config, model_name, cache_dir)
         loaded_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
         logger.info(f"{model_name} has parameter: {sum(p.numel() for p in model.parameters())}")
         print_memory_usage(logger, f"after load model {model_name}")
 
         # build dummy_input and forward
         dummy_input = tokenizer(text, return_tensors="pt")
-        if isinstance(dummy_input, MutableMapping):
-            dummy_input = dict(dummy_input)
-        forward_signature = inspect.signature(model.forward)
-        if 'decoder_input_ids' in forward_signature.parameters:
-            dummy_input['decoder_input_ids'] = dummy_input.get('input_ids', None)
-        logger.debug(f"{model_name} tokenized")
-        logger.debug(f"dummy_input: {dummy_input}")
-        
+        dummy_input = _prepare_nlp_input(model, dummy_input)
         model.eval()
         before_trace = model(**dummy_input)
-        # logger.debug(f"original logit: {before_trace['last_hidden_state'][:2]}")
-
-        if (torch.distributed.get_world_size() == 1 and torch.distributed.get_rank() == 0) or \
-            (torch.distributed.get_world_size() > 1 and torch.distributed.get_rank() == 1):
-
-            traced_gm = concrete_trace_wrap(model, dummy_input)
-            traced_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
-            traced_gm.eval()
-            after_trace = traced_gm(**dummy_input)
-            # logger.debug(f"traced logit: {after_trace['last_hidden_state'][:2]}")
-
-            if check_align(before_trace, after_trace):
-                trace_aligned_logger.info(f"{model_name}, {config.architectures}")
-            else:
-                error_in_cube_logger.error(f"{model_name} not aligned before and after trace\n before trace: {before_trace}\n after trace: {after_trace}\n")
-
-        # cube compile model
-        params_with_defaults = [
-            v.default if k not in dummy_input else dummy_input[k].to(torch.cuda.current_device())
-            for k, v in forward_signature.parameters.items()
-            if v.default is not inspect.Parameter.empty
-        ]
-        logger.debug(f"forward_signature: {forward_signature}")
-        logger.debug(f"params_with_defaults: {params_with_defaults}")
-        dataloader = microbatches((params_with_defaults, ) * 2)
         
-        model = load_model(config, model_name, cache_dir)
-        @cube.compile(model, dataloader, PAS=PASRandomSPMD)
-        def train_iter(model, dataloader):
-            data = next(dataloader)
-            logit = model(*data)
-            return logit
-
-        # torch.distributed.barrier()
-
-        smodel = cube.utils.load_model()
-        compiled_logger.info(f"{model_name}, {config.architectures if 'config' in locals() and config else None}")
-        smodel.eval()
-        compiled_logit = train_iter(smodel, dataloader)
-        # logger.debug(f"compiled logit: {compiled_logit['last_hidden_state'][:2]}")
-
-        if check_align(before_trace, compiled_logit):
-            compile_aligned_logger.info(f"{model_name}, {config.architectures}")
-        else:
-            error_in_cube_logger.error(f"{model_name} not aligned before trace and after compile\n before trace: {before_trace}\n after trace: {compiled_logit}\n")
+        if do_trace and torch.distributed.get_rank() == 0:
+            trace_forward_check(model, dummy_input, before_trace)
+        
+        if do_compile:
+            model = load_hf_model(config, model_name, cache_dir)
+            compile_forward_check(model, dummy_input, before_trace)
 
     except (TimeoutError, HTTPError, OSError, NameError, RuntimeError, KeyError) as e:
         if torch.distributed.get_rank() == 0:
@@ -354,12 +350,12 @@ def cube_compile_check(model_name: str):
             error_out_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
             error_out_cube_logger.error(error_message)
             summarize_error(model_name, error_out_cube_dict, os.path.join(log_dir, "error_out_cube.json"))
-    except Exception as e:
+    except Exception as e:  
+        # Exception will be cause by cube.compile, or the program will be blocked
         if torch.distributed.get_rank() == 0:
             torch.distributed.barrier()
-
+            
             logger.error(f"fail when compiling model: {model_name}", exc_info=False)
-
             error_message = traceback.format_exc().strip() + "\n"
             if 'MagicCube' in error_message:
                 error_in_cube_logger.error(f"{model_name}, {config.architectures if 'config' in locals() and config else None}, failed")
@@ -373,9 +369,6 @@ def cube_compile_check(model_name: str):
         end_time = time.time()
         logger.info(f"Finish trying model: {model_name}, time: {end_time - start_time:.2f} s")
         torch.distributed.barrier()
-
-error_out_cube_dict = {} # error_type: [model_name]
-error_in_cube_dict = {}
 
 def summarize_error(model_name, error_dict, log_path):
     import sys
@@ -400,10 +393,7 @@ def summarize_error(model_name, error_dict, log_path):
     with open(log_path, 'w') as json_file:
         json.dump(error_dict, json_file, indent=4)
 
-    # with open('error_dict.json', 'r') as json_file:  
-    #     loaded_error_dict = json.load(json_file)  
-
-if __name__ == "__main__":
+def _load_model_names(model_name_list_path, log_dir):
     model_names = []
     with open(model_name_list_path, 'r') as f:
         for line in f:
@@ -416,23 +406,33 @@ if __name__ == "__main__":
     if os.path.exists(os.path.join(log_dir, "cube_compile_2_tried.log")):
         with open(os.path.join(log_dir, "cube_compile_2_tried.log"), 'r') as file:
             tried_models = [line.strip() for line in file]
-    model_name_list = [model for model in model_names if model not in tried_models]
     print(f"# already_tried: {len(tried_models)}")
+    model_name_list = [model for model in model_names if model not in tried_models]
     print(f"# need_to_try: {len(model_name_list)}")
+    return model_name_list
 
+def _load_error_summary(log_dir):
     import json
+    error_out = {}
+    error_in = {}
     if os.path.exists(os.path.join(log_dir, "error_out_cube.json")):
         with open(os.path.join(log_dir, "error_out_cube.json"), 'r') as json_file:
-            error_out_cube_dict = json.load(json_file)
+            error_out = json.load(json_file)
     if os.path.exists(os.path.join(log_dir, "error_in_cube.json")):
         with open(os.path.join(log_dir, "error_in_cube.json"), 'r') as json_file:
-            error_in_cube_dict = json.load(json_file)
+            error_in = json.load(json_file)
+    return error_out, error_in
 
-    model_numbers = 0
-    torch.distributed.barrier()
-    for model_name in model_name_list:
-        with open(os.path.expanduser('~/workspace/auto-model-compiler/cube_related/logs/FxModuleParser_Warning.log') , 'a') as file:  
+if __name__ == "__main__":
+    model_name_list = _load_model_names(model_name_list_path, log_dir)
+    error_out_cube_dict, error_in_cube_dict = _load_error_summary(log_dir)
+
+    fxparser_warning_path = os.path.expanduser('~/workspace/auto-model-compiler/cube_related/logs/FxModuleParser_Warning.log')
+    with open(fxparser_warning_path, 'a') as file:
+        total_models = len(model_name_list)
+        for index, model_name in enumerate(model_name_list, 1):
             file.write(f"\n{model_name}\n")
-        cube_compile_check(model_name)
-        model_numbers += 1
-        logger.info(f"Process: {model_numbers} / {len(model_name_list)}, Percentage: {model_numbers / len(model_name_list) * 100:.2f}%\n\n")
+            compile_hf_nlp_worker(model_name)
+            logger.info(f"Process: {index} / {total_models}, Percentage: {(index / total_models) * 100:.2f}%\n\n")  
+
+
