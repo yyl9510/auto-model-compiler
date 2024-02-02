@@ -33,10 +33,12 @@ from cube.graph.graph import IRGraph
 from cube.ir.operator import IRDataOperation, IRFwOperation
 import random
 
+file_handler = logging.FileHandler(os.path.expanduser('~/workspace/auto-model-compiler/cube_related/logs/FxModuleParser_Warning.log'))
+cube.graph.parser.fx.parser._logger.addHandler(file_handler)
+
 torch.set_printoptions(edgeitems = 2)
 
 cube.init()
-
 
 current_file_path = os.path.abspath(__file__)
 current_folder = os.path.dirname(current_file_path)
