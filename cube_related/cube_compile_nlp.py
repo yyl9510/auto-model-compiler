@@ -6,9 +6,7 @@ from requests import HTTPError
 warnings.filterwarnings("ignore")
 
 import os
-current_file_path = os.path.abspath(__file__)
-current_folder = os.path.dirname(current_file_path)
-log_dir = os.path.join(current_folder, "logs")
+log_dir = os.path.expanduser('~/hf_logs')
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
@@ -39,16 +37,14 @@ torch.set_printoptions(edgeitems = 2)
 
 cube.init()
 
-# from cube.parallel import ComputeConfig
-# from cube.graph.segment import IRSegment
-# from examples.utils import get_policy
-# import examples.mlp.policy.gallery as gallery
-# from functools import partial
+
+current_file_path = os.path.abspath(__file__)
+current_folder = os.path.dirname(current_file_path)
 
 text: str = "Huggingface is a really excellent project!"
-cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache"
-model_name_list_path = os.path.join(current_folder, "models/test")  # Natural Language Processing
-LOAD_MODEL_TIMEOUT = True
+cache_dir: str = "/mnt/msrasrg/yileiyang/hf_cache2"
+model_name_list_path = os.path.join(current_folder, "models/Top_100_Tried")  # Natural Language Processing
+LOAD_MODEL_TIMEOUT = False
 error_out_cube_dict = {} # error_type: [model_name]
 error_in_cube_dict = {}
 
@@ -66,6 +62,7 @@ def setup_logger(log_file, level = logging.INFO, need_timestamp = True):
         if need_timestamp:
             formatter = logging.Formatter('%(asctime)s [PID %(process)d][%(levelname)s]: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
             handler.setFormatter(formatter)
+            handler.setLevel(level)
         logger.addHandler(handler)
     logger_list.append(logger)
     return logger
@@ -273,7 +270,6 @@ def prepare_dataloader(model, dummy_input):
     params_with_defaults = [
         v.default if k not in dummy_input else dummy_input[k].to(torch.cuda.current_device())
         for k, v in forward_signature.parameters.items()
-        if v.default is not inspect.Parameter.empty
     ]
     # logger.debug(f"forward_signature: {forward_signature}")
     # logger.debug(f"params_with_defaults: {params_with_defaults}")
@@ -313,6 +309,7 @@ def compile_forward_check(model: torch.nn.Module, dummy_input: dict, before_trac
 def compile_hf_nlp_worker(model_name: str, do_trace = True, do_compile = True):
     try:
         start_time = time.time()
+        torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
             subprocess.run('rm -rf gencode*.py fullmodel.pt.* dist_param_map.pt', shell=True, check=True)
         # load tokenizer, config, model
@@ -368,7 +365,6 @@ def compile_hf_nlp_worker(model_name: str, do_trace = True, do_compile = True):
     finally:
         end_time = time.time()
         logger.info(f"Finish trying model: {model_name}, time: {end_time - start_time:.2f} s")
-        torch.distributed.barrier()
 
 def summarize_error(model_name, error_dict, log_path):
     import sys
@@ -427,7 +423,7 @@ if __name__ == "__main__":
     model_name_list = _load_model_names(model_name_list_path, log_dir)
     error_out_cube_dict, error_in_cube_dict = _load_error_summary(log_dir)
 
-    fxparser_warning_path = os.path.expanduser('~/workspace/auto-model-compiler/cube_related/logs/FxModuleParser_Warning.log')
+    fxparser_warning_path = f'{log_dir}/FxModuleParser_Warning.log'
     with open(fxparser_warning_path, 'a') as file:
         total_models = len(model_name_list)
         for index, model_name in enumerate(model_name_list, 1):
